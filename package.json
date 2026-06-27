@@ -1,0 +1,17 @@
+{
+  "name": "penalty-multiplayer-server",
+  "version": "1.0.0",
+  "description": "Penalty Kings multiplayer server for Render",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.18.3",
+    "socket.io": "^4.7.5"
+  }
+}
