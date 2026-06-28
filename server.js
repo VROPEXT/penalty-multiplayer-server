@@ -7,13 +7,17 @@ const app = express();
 const server = http.createServer(app);
 
 app.get("/", (_req, res) => {
-  res.send("Penalty Kings multiplayer server v10 reliable start is running.");
+  res.send("Penalty Kings multiplayer server v11 reconnect grace is running.");
 });
 
 const io = new Server(server, {
   cors: { origin: true, methods: ["GET", "POST"] },
-  pingTimeout: 25000,
-  pingInterval: 10000
+  pingTimeout: 70000,
+  pingInterval: 25000,
+  connectionStateRecovery: {
+    maxDisconnectionDuration: 120000,
+    skipMiddlewares: true
+  }
 });
 
 const rooms = new Map();
@@ -57,6 +61,12 @@ function cleanSearchId(value) {
   return String(value || ("s-" + randomUUID().slice(0, 8)))
     .replace(/[^a-zA-Z0-9_.-]/g, "")
     .slice(0, 60);
+}
+
+function cleanClientId(value) {
+  return String(value || ("c-" + randomUUID().slice(0, 12)))
+    .replace(/[^a-zA-Z0-9_.-]/g, "")
+    .slice(0, 80);
 }
 
 function cleanColor(value, fallback) {
@@ -128,6 +138,7 @@ function updateSocketProfile(socket, data = {}) {
   socket.data.team = cleanTeam(data.team || socket.data.team || "BEL");
   socket.data.profile = cleanProfile(data.profile || socket.data.profile || {});
   socket.data.searchId = cleanSearchId(data.searchId || socket.data.searchId);
+  socket.data.clientId = cleanClientId(data.clientId || socket.data.clientId);
   socket.data.clientVersion = String(data.clientVersion || socket.data.clientVersion || "unknown").slice(0, 24);
 }
 
@@ -143,6 +154,69 @@ function removeWaiting(socket, notifySelf = false) {
     waitingSocketId = null;
     if (notifySelf) socket.emit("matchmakingCancelled", { reason: "cancelled", searchId: socket.data.searchId });
   }
+}
+
+function findRoomByClientId(clientId) {
+  if (!clientId) return null;
+  for (const room of rooms.values()) {
+    for (const id of room.players) {
+      if (room.clientIds && room.clientIds[id] === clientId) return room;
+    }
+  }
+  return null;
+}
+
+function clearDisconnectTimer(room, socketId) {
+  if (room && room.disconnectTimers && room.disconnectTimers[socketId]) {
+    clearTimeout(room.disconnectTimers[socketId]);
+    delete room.disconnectTimers[socketId];
+  }
+  if (room && room.disconnected) delete room.disconnected[socketId];
+}
+
+function replaceSocketInRoom(room, oldId, newSocket) {
+  if (!room || !oldId || !newSocket || oldId === newSocket.id) return;
+  const idx = room.players.indexOf(oldId);
+  if (idx === -1) return;
+  room.players[idx] = newSocket.id;
+  const transfer = (obj, fallback) => {
+    obj[newSocket.id] = obj[oldId] === undefined ? fallback : obj[oldId];
+    delete obj[oldId];
+  };
+  transfer(room.names, cleanName(newSocket.data.name));
+  transfer(room.teams, cleanTeam(newSocket.data.team));
+  transfer(room.profiles, cleanProfile(newSocket.data.profile));
+  transfer(room.searchIds, cleanSearchId(newSocket.data.searchId));
+  transfer(room.clientIds, cleanClientId(newSocket.data.clientId));
+  transfer(room.score, 0);
+  transfer(room.ready, false);
+  if (room.choices[oldId]) { room.choices[newSocket.id] = room.choices[oldId]; delete room.choices[oldId]; }
+  clearDisconnectTimer(room, oldId);
+  newSocket.join(room.id);
+  newSocket.data.roomId = room.id;
+}
+
+function scheduleDisconnect(socket) {
+  removeWaiting(socket, false);
+  const roomId = socket.data.roomId;
+  const room = roomId ? rooms.get(roomId) : null;
+  if (!room || !room.players.includes(socket.id)) return;
+  room.disconnected[socket.id] = Date.now();
+  for (const opponentId of room.players.filter((id) => id !== socket.id)) {
+    const opp = getSocket(opponentId);
+    if (opp) opp.emit("opponentConnectionLost", { roomId: room.id, playerId: socket.id, graceMs: 45000 });
+  }
+  clearDisconnectTimer(room, socket.id);
+  room.disconnectTimers[socket.id] = setTimeout(() => {
+    const latest = rooms.get(room.id);
+    if (!latest || !latest.players.includes(socket.id)) return;
+    for (const opponentId of latest.players.filter((id) => id !== socket.id)) {
+      const opp = getSocket(opponentId);
+      if (opp) opp.emit("opponentLeft", { roomId: latest.id, playerId: socket.id, reason: "disconnect-timeout" });
+    }
+    clearStartTimer(latest);
+    rooms.delete(latest.id);
+  }, 45000);
 }
 
 function leaveAllGameRooms(socket, notifySelf = false) {
@@ -175,8 +249,10 @@ function payloadFor(room, socketId) {
     names: { ...room.names },
     teams: { ...room.teams },
     profiles: { ...room.profiles },
+    clientIds: { ...(room.clientIds || {}) },
     searchIds: { ...room.searchIds },
     yourSearchId: room.searchIds[socketId] || null,
+    yourClientId: room.clientIds ? (room.clientIds[socketId] || null) : null,
     score: { ...room.score },
     turn: room.turn,
     maxTurns: room.maxTurns,
@@ -223,6 +299,10 @@ function makeRoom(playerA, playerB) {
       [playerA.id]: cleanSearchId(playerA.data.searchId),
       [playerB.id]: cleanSearchId(playerB.data.searchId)
     },
+    clientIds: {
+      [playerA.id]: cleanClientId(playerA.data.clientId),
+      [playerB.id]: cleanClientId(playerB.data.clientId)
+    },
     score: {
       [playerA.id]: 0,
       [playerB.id]: 0
@@ -234,7 +314,9 @@ function makeRoom(playerA, playerB) {
     ready: {},
     resolving: false,
     startEmitCount: 0,
-    startTimer: null
+    startTimer: null,
+    disconnected: {},
+    disconnectTimers: {}
   };
 
   rooms.set(roomId, room);
@@ -355,6 +437,16 @@ io.on("connection", (socket) => {
   socket.on("findFunMatch", (data = {}) => {
     updateSocketProfile(socket, data);
 
+    // If this browser was already in a room and reconnected, recover instead of creating a bad duplicate.
+    const recoverableRoom = findRoomByClientId(socket.data.clientId);
+    if (recoverableRoom) {
+      const oldId = recoverableRoom.players.find((id) => recoverableRoom.clientIds[id] === socket.data.clientId);
+      replaceSocketInRoom(recoverableRoom, oldId, socket);
+      socket.emit("recoveredRoom", payloadFor(recoverableRoom, socket.id));
+      emitMatchPayload(recoverableRoom, "forceStartMatch");
+      return;
+    }
+
     // A new search is always clean: remove this socket from old waiting/rooms first.
     leaveAllGameRooms(socket, false);
 
@@ -374,13 +466,38 @@ io.on("connection", (socket) => {
   });
 
   socket.on("getMyRoom", (data = {}) => {
-    const roomId = socket.data.roomId;
-    const room = roomId ? rooms.get(roomId) : null;
+    updateSocketProfile(socket, data);
+    let roomId = socket.data.roomId;
+    let room = roomId ? rooms.get(roomId) : null;
+    if ((!room || !room.players.includes(socket.id)) && socket.data.clientId) {
+      room = findRoomByClientId(socket.data.clientId);
+      if (room) {
+        const oldId = room.players.find((id) => room.clientIds[id] === socket.data.clientId);
+        replaceSocketInRoom(room, oldId, socket);
+      }
+    }
     if (!room || !room.players.includes(socket.id)) {
       socket.emit("serverNotice", { message: "No room assigned yet", searchId: cleanSearchId(data.searchId || socket.data.searchId) });
       return;
     }
     socket.emit("myRoom", payloadFor(room, socket.id));
+  });
+
+  socket.on("recoverRoom", (data = {}) => {
+    updateSocketProfile(socket, data);
+    const room = findRoomByClientId(socket.data.clientId);
+    if (!room) {
+      socket.emit("roomJoinFailed", { reason: "Could not recover room. Start a new match." });
+      return;
+    }
+    const oldId = room.players.find((id) => room.clientIds[id] === socket.data.clientId);
+    replaceSocketInRoom(room, oldId, socket);
+    socket.emit("recoveredRoom", payloadFor(room, socket.id));
+    emitMatchPayload(room, "forceStartMatch");
+    for (const opponentId of room.players.filter((id) => id !== socket.id)) {
+      const opp = getSocket(opponentId);
+      if (opp) opp.emit("opponentReconnected", { roomId: room.id });
+    }
   });
 
   socket.on("clientReady", (data = {}) => {
@@ -462,14 +579,13 @@ io.on("connection", (socket) => {
     resolveTurn(room);
   });
 
-  socket.on("disconnect", () => {
-    console.log("Disconnected:", socket.id);
-    leaveAllGameRooms(socket, false);
+  socket.on("disconnect", (reason) => {
+    console.log("Disconnected:", socket.id, reason);
+    scheduleDisconnect(socket);
   });
 });
 
 const PORT = process.env.PORT || 3000;
-
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("Penalty Kings multiplayer server v10 reliable start is running.");
+  console.log("Penalty Kings multiplayer server v11 reconnect grace running on port", PORT);
 });
