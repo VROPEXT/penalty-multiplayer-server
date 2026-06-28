@@ -7,7 +7,7 @@ const app = express();
 const server = http.createServer(app);
 
 app.get("/", (_req, res) => {
-  res.send("Penalty Kings multiplayer server v9 is running.");
+  res.send("Penalty Kings multiplayer server v10 reliable start is running.");
 });
 
 const io = new Server(server, {
@@ -158,6 +158,7 @@ function leaveAllGameRooms(socket, notifySelf = false) {
     }
 
     socket.leave(roomId);
+    if (socket.data.roomId === roomId) socket.data.roomId = null;
     rooms.delete(roomId);
 
     if (notifySelf) socket.emit("leftMatch", { roomId });
@@ -239,11 +240,14 @@ function makeRoom(playerA, playerB) {
   rooms.set(roomId, room);
   playerA.join(roomId);
   playerB.join(roomId);
+  playerA.data.roomId = roomId;
+  playerB.data.roomId = roomId;
 
   console.log("Room created:", roomId, room.names, room.searchIds, room.profiles);
 
   // Reliable start: if one tab misses the first event, it receives the room payload again.
   emitMatchPayload(room, "matchFound");
+  emitMatchPayload(room, "forceStartMatch");
   room.startTimer = setInterval(() => {
     if (!rooms.has(roomId)) {
       clearStartTimer(room);
@@ -251,6 +255,7 @@ function makeRoom(playerA, playerB) {
     }
     room.startEmitCount++;
     emitMatchPayload(room, room.startEmitCount % 2 ? "matchFound" : "matchStart");
+    emitMatchPayload(room, "forceStartMatch");
     maybeStopReliableStart(room);
     if (room.startEmitCount >= 16) clearStartTimer(room);
   }, 350);
@@ -324,6 +329,10 @@ function resolveTurn(room) {
         winnerId
       });
 
+      for (const id of room.players) {
+        const s = getSocket(id);
+        if (s && s.data.roomId === room.id) s.data.roomId = null;
+      }
       rooms.delete(room.id);
       return;
     }
@@ -362,6 +371,16 @@ io.on("connection", (socket) => {
 
     waitingSocketId = null;
     makeRoom(waiting, socket);
+  });
+
+  socket.on("getMyRoom", (data = {}) => {
+    const roomId = socket.data.roomId;
+    const room = roomId ? rooms.get(roomId) : null;
+    if (!room || !room.players.includes(socket.id)) {
+      socket.emit("serverNotice", { message: "No room assigned yet", searchId: cleanSearchId(data.searchId || socket.data.searchId) });
+      return;
+    }
+    socket.emit("myRoom", payloadFor(room, socket.id));
   });
 
   socket.on("clientReady", (data = {}) => {
@@ -451,5 +470,5 @@ io.on("connection", (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log("Penalty multiplayer server v9 running on port", PORT);
+  console.log("Penalty multiplayer server v10 reliable start running on port", PORT);
 });
