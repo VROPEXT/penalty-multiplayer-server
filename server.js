@@ -469,6 +469,7 @@ io.on("connection", (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log("Penalty multiplayer server v10 reliable start running on port", PORT);
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log("Penalty Kings multiplayer server v10 reliable start is running.");
 });
