@@ -33,7 +33,7 @@ app.get("/", (_req, res) => {
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
-    version: "v17",
+    version: "v18",
     rooms: rooms.size,
     waiting: !!waitingSocketId,
     uptime: process.uptime()
@@ -74,7 +74,7 @@ const MAX_REPLAY_X = POST_X + 1.15;
 
 // Tunable timing
 const RECONNECT_GRACE_MS = 120000;      // v14: keep rooms alive during proxy/browser reconnects
-const TURN_CHOICE_TIMEOUT_MS = 30000;   // v14: more time so players are not auto-played too fast
+const TURN_CHOICE_TIMEOUT_MS = 20000;   // v18: from 30s to 20s - still generous but less waiting
 const ZOMBIE_ROOM_TIMEOUT_MS = 5 * 60 * 1000;  // 5 minutes
 const ZOMBIE_SWEEP_INTERVAL_MS = 60 * 1000;    // every minute
 const RELIABLE_START_RETRIES = 60;      // v14: keep resending start until both clients confirm
@@ -694,7 +694,10 @@ function resolveTurn(room) {
   });
 
   setTimeout(() => {
-    // v12 SAFETY: if the room was deleted during the 3s wait (quit, disconnect),
+    // v18: between-turn delay reduced from 3000ms to 1200ms.
+    // The client already plays the ball animation in slow-mo and shows the
+    // result text. 3 seconds on top of that felt extremely slow.
+    // v12 SAFETY: if the room was deleted during the wait (quit, disconnect),
     // do NOT try to emit anything further. The room is gone.
     if (!rooms.has(room.id)) return;
 
@@ -739,7 +742,7 @@ function resolveTurn(room) {
 
     // Start choice timeout for next turn
     startTurnTimeout(room);
-  }, 3000);
+  }, 1200);
 }
 
 // =============================================================================
@@ -997,5 +1000,5 @@ io.on("connection", (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("Penalty Kings multiplayer server v17 stable roles resume running on port", PORT);
+  console.log("Penalty Kings multiplayer server v18 speed boost running on port", PORT);
 });
