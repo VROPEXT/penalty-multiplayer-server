@@ -4,7 +4,7 @@ const { Server } = require("socket.io");
 const { randomUUID } = require("crypto");
 
 // =============================================================================
-// Penalty Kings multiplayer server v16 - choice clientId identity fix
+// Penalty Kings multiplayer server v17 - stable clientId roles + refresh resume
 // Fixes vs v15:
 //  - Explicit CORS middleware on Express level (Northflank/HTTP2 sometimes drops
 //    preflight headers, causing the client to see "xhr poll error" on connection)
@@ -27,13 +27,13 @@ app.use((req, res, next) => {
 });
 
 app.get("/", (_req, res) => {
-  res.send("Penalty Kings multiplayer server v16 choice clientId identity fix is running.");
+  res.send("Penalty Kings multiplayer server v17 stable clientId roles + refresh resume is running.");
 });
 
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
-    version: "v16",
+    version: "v17",
     rooms: rooms.size,
     waiting: !!waitingSocketId,
     uptime: process.uptime()
@@ -308,6 +308,52 @@ function getRoomForSocketOrClient(data = {}, socket) {
   return room;
 }
 
+function getRoomByRoomIdOrClient(data = {}, socket) {
+  updateSocketProfile(socket, data);
+  let room = data.roomId ? rooms.get(String(data.roomId)) : null;
+  if (!room && socket.data.clientId) room = findRoomByClientId(socket.data.clientId);
+  return room || null;
+}
+
+function resolvePlayerInRoom(room, socket, data = {}, expectedId = null) {
+  if (!room || !socket) return null;
+  updateSocketProfile(socket, data);
+  const cid = socket.data.clientId;
+
+  if (room.players.includes(socket.id)) {
+    clearDisconnectTimer(room, socket.id);
+    room.clientIds[socket.id] = cid;
+    room.names[socket.id] = socket.data.name;
+    room.teams[socket.id] = socket.data.team;
+    room.profiles[socket.id] = socket.data.profile;
+    socket.join(room.id);
+    socket.data.roomId = room.id;
+    return socket.id;
+  }
+
+  let oldId = null;
+  if (expectedId && room.clientIds && room.clientIds[expectedId] === cid) oldId = expectedId;
+  if (!oldId) oldId = findPlayerIdByClientId(room, cid);
+  if (!oldId) return null;
+
+  replaceSocketInRoom(room, oldId, socket);
+  return socket.id;
+}
+
+function leaveRoomsByClientId(clientId, notifySelfSocket = null, reason = "client-new-match") {
+  if (!clientId) return;
+  for (const [roomId, room] of Array.from(rooms.entries())) {
+    const playerId = findPlayerIdByClientId(room, clientId);
+    if (!playerId) continue;
+    for (const opponentId of room.players.filter((id) => id !== playerId)) {
+      const opp = getSocket(opponentId);
+      if (opp) opp.emit("opponentLeft", { roomId, playerId, reason });
+    }
+    deleteRoom(roomId, reason);
+    if (notifySelfSocket) notifySelfSocket.emit("leftMatch", { roomId });
+  }
+}
+
 function rejectChoice(socket, room, reason, extra = {}) {
   socket.emit("choiceRejected", {
     roomId: room ? room.id : (extra.roomId || null),
@@ -433,6 +479,9 @@ function leaveAllGameRooms(socket, notifySelf = false) {
 
 function payloadFor(room, socketId) {
   const opponentId = room.players.find((id) => id !== socketId) || null;
+  const shooterId = room.players[room.shooterIndex];
+  const keeperId = room.players[1 - room.shooterIndex];
+  const clientIds = { ...(room.clientIds || {}) };
   return {
     roomId: room.id,
     youId: socketId,
@@ -441,14 +490,19 @@ function payloadFor(room, socketId) {
     names: { ...room.names },
     teams: { ...room.teams },
     profiles: { ...room.profiles },
-    clientIds: { ...(room.clientIds || {}) },
+    clientIds,
     searchIds: { ...room.searchIds },
     yourSearchId: room.searchIds[socketId] || null,
-    yourClientId: room.clientIds ? (room.clientIds[socketId] || null) : null,
+    yourClientId: clientIds[socketId] || null,
+    youClientId: clientIds[socketId] || null,
+    opponentClientId: opponentId ? (clientIds[opponentId] || null) : null,
     score: { ...room.score },
     turn: room.turn,
     maxTurns: room.maxTurns,
-    shooterId: room.players[room.shooterIndex],
+    shooterId,
+    keeperId,
+    shooterClientId: clientIds[shooterId] || null,
+    keeperClientId: clientIds[keeperId] || null,
     serverTime: Date.now()
   };
 }
@@ -628,6 +682,9 @@ function resolveTurn(room) {
     resultType,
     shooterId,
     keeperId,
+    shooterClientId: room.clientIds[shooterId] || null,
+    keeperClientId: room.clientIds[keeperId] || null,
+    clientIds: { ...room.clientIds },
     shot,
     dive,
     keeperReach,
@@ -656,7 +713,9 @@ function resolveTurn(room) {
       io.to(room.id).emit("matchEnd", {
         roomId: room.id,
         score: { ...room.score },
-        winnerId
+        winnerId,
+        winnerClientId: winnerId ? (room.clientIds[winnerId] || null) : null,
+        clientIds: { ...room.clientIds }
       });
 
       for (const id of room.players) {
@@ -673,7 +732,9 @@ function resolveTurn(room) {
       roomId: room.id,
       turn: room.turn,
       score: { ...room.score },
-      shooterId: room.players[room.shooterIndex]
+      shooterId: room.players[room.shooterIndex],
+      shooterClientId: room.clientIds[room.players[room.shooterIndex]] || null,
+      clientIds: { ...room.clientIds }
     });
 
     // Start choice timeout for next turn
@@ -723,20 +784,20 @@ io.on("connection", (socket) => {
   socket.on("findFunMatch", (data = {}) => {
     updateSocketProfile(socket, data);
 
-    // If this browser was already in a room and reconnected, recover instead of creating a bad duplicate.
-    const recoverableRoom = findRoomByClientId(socket.data.clientId);
-    if (recoverableRoom) {
-      const oldId = recoverableRoom.players.find((id) => recoverableRoom.clientIds[id] === socket.data.clientId);
-      replaceSocketInRoom(recoverableRoom, oldId, socket);
-      socket.emit("recoveredRoom", payloadFor(recoverableRoom, socket.id));
-      resumeRoomIfReady(recoverableRoom);
-      return;
+    // v17: PLAY AGAINST OTHER means NEW match. Do not recover an old room here.
+    // Refresh/reconnect uses recoverRoom instead. This fixes skin/profile changes
+    // causing one browser to be stuck rejoining an old hidden room.
+    if (data.newMatch === true) {
+      leaveRoomsByClientId(socket.data.clientId, null, "new-match-request");
     }
-
-    // A new search is always clean: remove this socket from old waiting/rooms first.
     leaveAllGameRooms(socket, false);
 
-    const waiting = waitingSocketId ? getSocket(waitingSocketId) : null;
+    let waiting = waitingSocketId ? getSocket(waitingSocketId) : null;
+    if (waiting && waiting.data && waiting.data.clientId === socket.data.clientId) {
+      waitingSocketId = null;
+      waiting = null;
+    }
+
     if (!waiting || !waiting.connected || waiting.id === socket.id) {
       waitingSocketId = socket.id;
       socket.emit("waitingForPlayer", {
@@ -772,14 +833,14 @@ io.on("connection", (socket) => {
 
   socket.on("recoverRoom", (data = {}) => {
     updateSocketProfile(socket, data);
-    const room = findRoomByClientId(socket.data.clientId);
-    if (!room) {
-      socket.emit("roomJoinFailed", { reason: "Could not recover room. Start a new match." });
+    let room = getRoomByRoomIdOrClient(data, socket);
+    if (!room || !findPlayerIdByClientId(room, socket.data.clientId)) {
+      socket.emit("roomJoinFailed", { reason: "Could not recover room. Start a new match.", resumeFailed: !!data.resume });
       return;
     }
-    const oldId = room.players.find((id) => room.clientIds[id] === socket.data.clientId);
-    replaceSocketInRoom(room, oldId, socket);
+    resolvePlayerInRoom(room, socket, data);
     socket.emit("recoveredRoom", payloadFor(room, socket.id));
+    socket.emit("matchReady", payloadFor(room, socket.id));
     resumeRoomIfReady(room);
     for (const opponentId of room.players.filter((id) => id !== socket.id)) {
       const opp = getSocket(opponentId);
@@ -789,8 +850,9 @@ io.on("connection", (socket) => {
 
   socket.on("clientReady", (data = {}) => {
     const room = getRoomForSocketOrClient(data, socket);
-    if (!room || !room.players.includes(socket.id)) return;
-    room.ready[socket.id] = true;
+    const playerId = resolvePlayerInRoom(room, socket, data);
+    if (!room || !playerId || !room.players.includes(playerId)) return;
+    room.ready[playerId] = true;
     touchRoom(room);
 
     // Always refresh this player with the authoritative payload.
@@ -820,10 +882,14 @@ io.on("connection", (socket) => {
       socket.emit("serverNotice", { message: "Profile updated while waiting." });
     }
     for (const room of rooms.values()) {
-      if (room.players.includes(socket.id)) {
-        room.names[socket.id] = socket.data.name;
-        room.teams[socket.id] = socket.data.team;
-        room.profiles[socket.id] = socket.data.profile;
+      const playerId = room.players.includes(socket.id) ? socket.id : findPlayerIdByClientId(room, socket.data.clientId);
+      if (playerId) {
+        room.names[playerId] = socket.data.name;
+        room.teams[playerId] = socket.data.team;
+        room.profiles[playerId] = socket.data.profile;
+        room.clientIds[playerId] = socket.data.clientId;
+        touchRoom(room);
+        emitMatchPayload(room, "matchReady");
       }
     }
   });
@@ -834,12 +900,11 @@ io.on("connection", (socket) => {
 
   socket.on("leaveMatch", (data = {}) => {
     updateSocketProfile(socket, data);
-    const room = getRoomForSocketOrClient(data, socket);
-    if (room && !room.players.includes(socket.id)) {
-      attachSocketToRoomByClientId(room, socket, data);
-    }
+    const room = getRoomByRoomIdOrClient(data, socket);
+    if (room) resolvePlayerInRoom(room, socket, data);
     socket.data._manualLeave = true;
     leaveAllGameRooms(socket, true);
+    leaveRoomsByClientId(socket.data.clientId, socket, "manual-leave");
   });
 
   socket.on("shotChoice", (data = {}) => {
@@ -848,14 +913,13 @@ io.on("connection", (socket) => {
     if (room.resolving) return;
 
     let shooterId = room.players[room.shooterIndex];
-    if (socket.id !== shooterId) {
-      attachSocketToRoomByClientId(room, socket, data, shooterId);
-      shooterId = room.players[room.shooterIndex];
-    }
-    if (socket.id !== shooterId) {
+    const playerId = resolvePlayerInRoom(room, socket, data, shooterId);
+    shooterId = room.players[room.shooterIndex];
+    if (playerId !== shooterId) {
       return rejectChoice(socket, room, "not-current-shooter", {
         expectedRole: "shooter",
         expectedPlayerId: shooterId,
+        expectedClientId: room.clientIds[shooterId] || null,
         yourSocketId: socket.id,
         yourClientId: socket.data.clientId
       });
@@ -868,16 +932,16 @@ io.on("connection", (socket) => {
       return rejectChoice(socket, room, "bad-shot-payload", { expectedRole: "shooter" });
     }
 
-    room.choices[socket.id] = {
-      ...room.choices[socket.id],
+    room.choices[shooterId] = {
+      ...room.choices[shooterId],
       shot: computeShotTarget(aimNorm, power, precision)
     };
     touchRoom(room);
 
     io.to(room.id).emit("choiceLocked", {
       roomId: room.id,
-      playerId: socket.id,
-      clientId: socket.data.clientId,
+      playerId: shooterId,
+      clientId: room.clientIds[shooterId] || socket.data.clientId,
       role: "shooter",
       turn: room.turn
     });
@@ -891,14 +955,13 @@ io.on("connection", (socket) => {
     if (room.resolving) return;
 
     let keeperId = room.players[1 - room.shooterIndex];
-    if (socket.id !== keeperId) {
-      attachSocketToRoomByClientId(room, socket, data, keeperId);
-      keeperId = room.players[1 - room.shooterIndex];
-    }
-    if (socket.id !== keeperId) {
+    const playerId = resolvePlayerInRoom(room, socket, data, keeperId);
+    keeperId = room.players[1 - room.shooterIndex];
+    if (playerId !== keeperId) {
       return rejectChoice(socket, room, "not-current-keeper", {
         expectedRole: "keeper",
         expectedPlayerId: keeperId,
+        expectedClientId: room.clientIds[keeperId] || null,
         yourSocketId: socket.id,
         yourClientId: socket.data.clientId
       });
@@ -909,16 +972,16 @@ io.on("connection", (socket) => {
       return rejectChoice(socket, room, "bad-dive-payload", { expectedRole: "keeper" });
     }
 
-    room.choices[socket.id] = {
-      ...room.choices[socket.id],
+    room.choices[keeperId] = {
+      ...room.choices[keeperId],
       dive: direction
     };
     touchRoom(room);
 
     io.to(room.id).emit("choiceLocked", {
       roomId: room.id,
-      playerId: socket.id,
-      clientId: socket.data.clientId,
+      playerId: keeperId,
+      clientId: room.clientIds[keeperId] || socket.data.clientId,
       role: "keeper",
       turn: room.turn
     });
@@ -934,5 +997,5 @@ io.on("connection", (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("Penalty Kings multiplayer server v16 choice identity fix running on port", PORT);
+  console.log("Penalty Kings multiplayer server v17 stable roles resume running on port", PORT);
 });
