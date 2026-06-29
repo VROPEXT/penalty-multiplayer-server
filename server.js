@@ -4,7 +4,7 @@ const { Server } = require("socket.io");
 const { randomUUID } = require("crypto");
 
 // =============================================================================
-// Penalty Kings multiplayer server v18 - fast choices + stable quit
+// Penalty Kings multiplayer server v19 - instant turns + quit fix
 // Fixes vs v17:
 //  - Explicit CORS middleware on Express level (Northflank/HTTP2 sometimes drops
 //    preflight headers, causing the client to see "xhr poll error" on connection)
@@ -27,13 +27,13 @@ app.use((req, res, next) => {
 });
 
 app.get("/", (_req, res) => {
-  res.send("Penalty Kings multiplayer server v18 fast choices + stable quit is running.");
+  res.send("Penalty Kings multiplayer server v19 instant turns + quit fix is running.");
 });
 
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
-    version: "v18",
+    version: "v19",
     rooms: rooms.size,
     waiting: !!waitingSocketId,
     uptime: process.uptime()
@@ -74,11 +74,12 @@ const MAX_REPLAY_X = POST_X + 1.15;
 
 // Tunable timing
 const RECONNECT_GRACE_MS = 120000;      // v14: keep rooms alive during proxy/browser reconnects
-const TURN_CHOICE_TIMEOUT_MS = 12000;   // v18: safety only; BOTH choices resolve immediately
+const TURN_CHOICE_TIMEOUT_MS = 5000;    // v19: safety only; BOTH choices resolve immediately
 const ZOMBIE_ROOM_TIMEOUT_MS = 5 * 60 * 1000;  // 5 minutes
 const ZOMBIE_SWEEP_INTERVAL_MS = 60 * 1000;    // every minute
 const RELIABLE_START_RETRIES = 60;      // v14: keep resending start until both clients confirm
-const RELIABLE_START_INTERVAL_MS = 500; // v14: reliable start tick
+const RELIABLE_START_INTERVAL_MS = 250; // v19: faster reliable start tick
+const NEXT_TURN_DELAY_MS = 650;       // v19: fast next turn after the replay/result starts
 
 function getSocket(id) {
   return io.sockets.sockets.get(id) || null;
@@ -337,6 +338,7 @@ function resolvePlayerInRoom(room, socket, data = {}, expectedId = null) {
   if (!oldId) return null;
 
   replaceSocketInRoom(room, oldId, socket);
+  scheduleInstantResolve(room, "recover-choice-check");
   return socket.id;
 }
 
@@ -603,6 +605,7 @@ function makeRoom(playerA, playerB) {
     ready: {},
     gameStarted: false,
     resolving: false,
+    resolveScheduled: false,
     startEmitCount: 0,
     startTimer: null,
     turnTimer: null,
@@ -693,6 +696,29 @@ function emitChoiceLockedFast(room, playerId, role) {
   }
 }
 
+function scheduleInstantResolve(room, reason = "choice") {
+  if (!room || !rooms.has(room.id) || room.resolving || room.resolveScheduled) return;
+  const shooterId = room.players[room.shooterIndex];
+  const keeperId = room.players[1 - room.shooterIndex];
+  const hasShot = !!choiceForPlayer(room, shooterId, 'shot');
+  const hasDive = choiceForPlayer(room, keeperId, 'dive') !== undefined;
+  if (!hasShot || !hasDive) return;
+
+  room.resolveScheduled = true;
+  clearTurnTimer(room);
+  io.to(room.id).emit("bothChoicesLocked", {
+    roomId: room.id,
+    turn: room.turn,
+    reason,
+    message: "Both choices locked. Resolving instantly."
+  });
+  setImmediate(() => {
+    if (!rooms.has(room.id)) return;
+    room.resolveScheduled = false;
+    resolveTurn(room);
+  });
+}
+
 function resolveTurn(room) {
   if (!room || room.resolving) return;
 
@@ -704,6 +730,7 @@ function resolveTurn(room) {
   if (!shot || dive === undefined) return;
 
   room.resolving = true;
+  room.resolveScheduled = false;
   clearStartTimer(room);
   clearTurnTimer(room);
   touchRoom(room);
@@ -743,7 +770,8 @@ function resolveTurn(room) {
     keeperReach,
     score: { ...room.score },
     turn: room.turn,
-    maxTurns: room.maxTurns
+    maxTurns: room.maxTurns,
+    nextTurnDelayMs: NEXT_TURN_DELAY_MS
   });
 
   setTimeout(() => {
@@ -756,6 +784,7 @@ function resolveTurn(room) {
     room.choiceTurns = {};
     room.turn++;
     room.resolving = false;
+    room.resolveScheduled = false;
     touchRoom(room);
 
     if (room.turn > room.maxTurns) {
@@ -789,12 +818,14 @@ function resolveTurn(room) {
       score: { ...room.score },
       shooterId: room.players[room.shooterIndex],
       shooterClientId: room.clientIds[room.players[room.shooterIndex]] || null,
-      clientIds: { ...room.clientIds }
+      clientIds: { ...room.clientIds },
+      fast: true,
+      nextTurnDelayMs: NEXT_TURN_DELAY_MS
     });
 
     // Start choice timeout for next turn
     startTurnTimeout(room);
-  }, 3000);
+  }, NEXT_TURN_DELAY_MS);
 }
 
 // =============================================================================
@@ -909,6 +940,7 @@ io.on("connection", (socket) => {
     if (!room || !playerId || !room.players.includes(playerId)) return;
     room.ready[playerId] = true;
     touchRoom(room);
+    scheduleInstantResolve(room, "clientReady-choice-check");
 
     // Always refresh this player with the authoritative payload.
     socket.emit("matchReady", payloadFor(room, socket.id));
@@ -992,9 +1024,8 @@ io.on("connection", (socket) => {
 
     emitChoiceLockedFast(room, shooterId, "shooter");
 
-    // v18: do not wait for the timeout/retry loop. As soon as both stable-clientId
-    // choices are present, resolve immediately on the same tick.
-    resolveTurn(room);
+    // v19: resolve on the same tick as soon as both stable-clientId choices exist.
+    scheduleInstantResolve(room, "shotChoice");
   });
 
   socket.on("diveChoice", (data = {}) => {
@@ -1025,9 +1056,8 @@ io.on("connection", (socket) => {
 
     emitChoiceLockedFast(room, keeperId, "keeper");
 
-    // v18: do not wait for the timeout/retry loop. As soon as both stable-clientId
-    // choices are present, resolve immediately on the same tick.
-    resolveTurn(room);
+    // v19: resolve on the same tick as soon as both stable-clientId choices exist.
+    scheduleInstantResolve(room, "diveChoice");
   });
 
   socket.on("disconnect", (reason) => {
@@ -1038,5 +1068,5 @@ io.on("connection", (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("Penalty Kings multiplayer server v18 fast choices + stable quit running on port", PORT);
+  console.log("Penalty Kings multiplayer server v19 instant turns + quit fix running on port", PORT);
 });
