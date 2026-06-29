@@ -4,23 +4,54 @@ const { Server } = require("socket.io");
 const { randomUUID } = require("crypto");
 
 // =============================================================================
-// Penalty Kings multiplayer server v12 - cleaner start, faster timeouts
-// Fixes vs v11:
-//  - matchFound is emitted only twice (initial + one safety retry), not 16x
-//  - per-turn timeout: 12s max waiting for a player's choice
-//  - reconnect grace reduced to 20s (was 45s, too long for the opponent)
-//  - zombie room cleanup: rooms with no activity for 5 minutes are removed
+// Penalty Kings multiplayer server v13 - explicit CORS, defensive timers
+// Fixes vs v12:
+//  - Explicit CORS middleware on Express level (Northflank/HTTP2 sometimes drops
+//    preflight headers, causing the client to see "xhr poll error" on connection)
+//  - Try/catch around the zombie sweep so a single bad room never crashes the server
+//  - More permissive Socket.IO CORS (origin: "*", credentials: false)
 // =============================================================================
 
 const app = express();
 const server = http.createServer(app);
 
+// v13: explicit CORS for HTTP routes - guarantees the browser sees Access-Control-Allow-Origin
+// on every response, including Socket.IO polling requests.
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
+  res.header("Access-Control-Max-Age", "86400");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 app.get("/", (_req, res) => {
-  res.send("Penalty Kings multiplayer server v12 is running.");
+  res.send("Penalty Kings multiplayer server v13 is running.");
+});
+
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    version: "v13",
+    rooms: rooms.size,
+    waiting: !!waitingSocketId,
+    uptime: process.uptime()
+  });
 });
 
 const io = new Server(server, {
-  cors: { origin: true, methods: ["GET", "POST"] },
+  // v13: more permissive CORS - allow ANY origin without credentials.
+  // This works for static HTML, file:// URLs, and CrazyGames sandboxed iframes.
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"],
+    credentials: false
+  },
+  // v13: explicit allowEIO3 for backward compat with older clients
+  allowEIO3: true,
+  // v13: increased maxHttpBufferSize to be safe with bigger payloads
+  maxHttpBufferSize: 1e6,
   pingTimeout: 60000,
   pingInterval: 25000,
   connectionStateRecovery: {
@@ -523,21 +554,38 @@ function resolveTurn(room) {
 
 // =============================================================================
 // v12: Zombie room sweeper - clean up rooms that have not had activity for 5min
+// v13: wrapped in try/catch so a bad room can never crash the whole server
 // =============================================================================
 setInterval(() => {
-  const now = Date.now();
-  for (const [roomId, room] of rooms.entries()) {
-    const idle = now - (room.lastActivity || 0);
-    if (idle > ZOMBIE_ROOM_TIMEOUT_MS) {
-      console.log("Zombie room sweep: cleaning up room", roomId, "idle for", idle, "ms");
-      for (const id of room.players) {
-        const s = getSocket(id);
-        if (s) s.emit("opponentLeft", { roomId, reason: "zombie-room" });
+  try {
+    const now = Date.now();
+    for (const [roomId, room] of rooms.entries()) {
+      try {
+        const idle = now - (room.lastActivity || 0);
+        if (idle > ZOMBIE_ROOM_TIMEOUT_MS) {
+          console.log("Zombie room sweep: cleaning up room", roomId, "idle for", idle, "ms");
+          for (const id of room.players) {
+            const s = getSocket(id);
+            if (s) s.emit("opponentLeft", { roomId, reason: "zombie-room" });
+          }
+          deleteRoom(roomId, "zombie-sweep");
+        }
+      } catch (innerErr) {
+        console.error("[zombie-sweep] error on room", roomId, innerErr);
       }
-      deleteRoom(roomId, "zombie-sweep");
     }
+  } catch (outerErr) {
+    console.error("[zombie-sweep] outer error", outerErr);
   }
 }, ZOMBIE_SWEEP_INTERVAL_MS);
+
+// v13: global uncaught error handlers so a bad code path never silently kills the server
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException]", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[unhandledRejection]", reason);
+});
 
 io.on("connection", (socket) => {
   console.log("Connected:", socket.id);
@@ -697,5 +745,5 @@ io.on("connection", (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("Penalty Kings multiplayer server v12 running on port", PORT);
+  console.log("Penalty Kings multiplayer server v13 running on port", PORT);
 });
