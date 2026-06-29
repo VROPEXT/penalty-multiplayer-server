@@ -4,7 +4,7 @@ const { Server } = require("socket.io");
 const { randomUUID } = require("crypto");
 
 // =============================================================================
-// Penalty Kings multiplayer server v13 - explicit CORS, defensive timers
+// Penalty Kings multiplayer server v14 - ready-gated match start, no false leave
 // Fixes vs v12:
 //  - Explicit CORS middleware on Express level (Northflank/HTTP2 sometimes drops
 //    preflight headers, causing the client to see "xhr poll error" on connection)
@@ -27,13 +27,13 @@ app.use((req, res, next) => {
 });
 
 app.get("/", (_req, res) => {
-  res.send("Penalty Kings multiplayer server v13 is running.");
+  res.send("Penalty Kings multiplayer server v14 stable ready-gated is running.");
 });
 
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
-    version: "v13",
+    version: "v14",
     rooms: rooms.size,
     waiting: !!waitingSocketId,
     uptime: process.uptime()
@@ -73,12 +73,12 @@ const INSIDE_POST_X = POST_X - 0.12;
 const MAX_REPLAY_X = POST_X + 1.15;
 
 // Tunable timing
-const RECONNECT_GRACE_MS = 20000;       // was 45000
-const TURN_CHOICE_TIMEOUT_MS = 15000;   // new: max wait for a choice
+const RECONNECT_GRACE_MS = 120000;      // v14: keep rooms alive during proxy/browser reconnects
+const TURN_CHOICE_TIMEOUT_MS = 30000;   // v14: more time so players are not auto-played too fast
 const ZOMBIE_ROOM_TIMEOUT_MS = 5 * 60 * 1000;  // 5 minutes
 const ZOMBIE_SWEEP_INTERVAL_MS = 60 * 1000;    // every minute
-const RELIABLE_START_RETRIES = 2;       // was 16
-const RELIABLE_START_INTERVAL_MS = 600; // was 350
+const RELIABLE_START_RETRIES = 60;      // v14: keep resending start until both clients confirm
+const RELIABLE_START_INTERVAL_MS = 500; // v14: reliable start tick
 
 function getSocket(id) {
   return io.sockets.sockets.get(id) || null;
@@ -276,28 +276,65 @@ function replaceSocketInRoom(room, oldId, newSocket) {
   touchRoom(room);
 }
 
-function scheduleDisconnect(socket) {
+function scheduleDisconnect(socket, reason = "") {
   removeWaiting(socket, false);
   const roomId = socket.data.roomId;
   const room = roomId ? rooms.get(roomId) : null;
   if (!room || !room.players.includes(socket.id)) return;
-  room.disconnected[socket.id] = Date.now();
+
+  // v14: a Socket.IO "transport close" can happen while the tab is still alive.
+  // Do NOT immediately delete the room. Keep it alive and let the client recover.
+  room.disconnected[socket.id] = { at: Date.now(), reason: String(reason || "") };
+  touchRoom(room);
+
   for (const opponentId of room.players.filter((id) => id !== socket.id)) {
     const opp = getSocket(opponentId);
-    if (opp) opp.emit("opponentConnectionLost", { roomId: room.id, playerId: socket.id, graceMs: RECONNECT_GRACE_MS });
+    if (opp) {
+      opp.emit("opponentConnectionLost", {
+        roomId: room.id,
+        playerId: socket.id,
+        reason: String(reason || "transport-close"),
+        graceMs: RECONNECT_GRACE_MS
+      });
+    }
   }
+
   clearDisconnectTimer(room, socket.id);
   room.disconnectTimers[socket.id] = setTimeout(() => {
     const latest = rooms.get(room.id);
     if (!latest || !latest.players.includes(socket.id)) return;
+
+    // v14: only a deliberate client namespace disconnect is treated as a real leave.
+    // Network/proxy transport closes only keep the room in a reconnecting state.
+    const stored = latest.disconnected && latest.disconnected[socket.id];
+    const storedReason = stored && stored.reason ? String(stored.reason) : String(reason || "");
+    if (storedReason === "client namespace disconnect" && socket.data._manualLeave === true) {
+      for (const opponentId of latest.players.filter((id) => id !== socket.id)) {
+        const opp = getSocket(opponentId);
+        if (opp) opp.emit("opponentLeft", { roomId: latest.id, playerId: socket.id, reason: "manual-disconnect" });
+      }
+      deleteRoom(latest.id, "manual-disconnect-expired");
+      return;
+    }
+
+    // Keep the match open instead of forcing lobby. The active client can continue
+    // seeing a reconnect message or quit manually.
     for (const opponentId of latest.players.filter((id) => id !== socket.id)) {
       const opp = getSocket(opponentId);
-      if (opp) opp.emit("opponentLeft", { roomId: latest.id, playerId: socket.id, reason: "disconnect-timeout" });
+      if (opp) {
+        opp.emit("opponentConnectionLost", {
+          roomId: latest.id,
+          playerId: socket.id,
+          reason: "reconnect-grace-expired-but-room-kept",
+          graceMs: 0,
+          keepRoom: true
+        });
+      }
     }
-    deleteRoom(latest.id, "disconnect-grace-expired");
+    if (latest.disconnectTimers) delete latest.disconnectTimers[socket.id];
+    touchRoom(latest);
   }, RECONNECT_GRACE_MS);
 }
-
 function leaveAllGameRooms(socket, notifySelf = false) {
   removeWaiting(socket, notifySelf);
 
@@ -306,7 +343,7 @@ function leaveAllGameRooms(socket, notifySelf = false) {
 
     const opponents = room.players.filter((id) => id !== socket.id);
     for (const opponentId of opponents) {
-      io.to(opponentId).emit("opponentLeft", { roomId, playerId: socket.id });
+      io.to(opponentId).emit("opponentLeft", { roomId, playerId: socket.id, reason: "manual-leave" });
     }
 
     socket.leave(roomId);
@@ -416,6 +453,7 @@ function makeRoom(playerA, playerB) {
     shooterIndex: 0,
     choices: {},
     ready: {},
+    gameStarted: false,
     resolving: false,
     startEmitCount: 0,
     startTimer: null,
@@ -453,8 +491,7 @@ function makeRoom(playerA, playerB) {
     if (room.startEmitCount >= RELIABLE_START_RETRIES) clearStartTimer(room);
   }, RELIABLE_START_INTERVAL_MS);
 
-  // Start counting time for the first turn
-  startTurnTimeout(room);
+  // v14: do NOT start turn timeout yet. Wait until both browsers send clientReady.
 }
 
 function resolveTurn(room) {
@@ -660,7 +697,19 @@ io.on("connection", (socket) => {
     if (!room || !room.players.includes(socket.id)) return;
     room.ready[socket.id] = true;
     touchRoom(room);
+
+    // Always refresh this player with the authoritative payload.
+    socket.emit("matchReady", payloadFor(room, socket.id));
     maybeStopReliableStart(room);
+
+    // v14: start the actual turn timer only when BOTH clients confirmed the arena loaded.
+    const allReady = room.players.every((id) => room.ready[id]);
+    if (allReady && !room.gameStarted) {
+      room.gameStarted = true;
+      emitMatchPayload(room, "matchReady");
+      startTurnTimeout(room);
+      console.log("Room ready, gameplay timer started:", room.id);
+    }
   });
 
   socket.on("updateProfile", (data = {}) => {
@@ -682,6 +731,7 @@ io.on("connection", (socket) => {
   });
 
   socket.on("leaveMatch", () => {
+    socket.data._manualLeave = true;
     leaveAllGameRooms(socket, true);
   });
 
@@ -739,11 +789,11 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", (reason) => {
     console.log("Disconnected:", socket.id, reason);
-    scheduleDisconnect(socket);
+    scheduleDisconnect(socket, reason);
   });
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("Penalty Kings multiplayer server v13 running on port", PORT);
+  console.log("Penalty Kings multiplayer server v14 stable ready-gated running on port", PORT);
 });
