@@ -4,7 +4,7 @@ const { Server } = require("socket.io");
 const { randomUUID } = require("crypto");
 
 // =============================================================================
-// Penalty Kings multiplayer server v14 - ready-gated match start, no false leave
+// Penalty Kings multiplayer server v15 - no forced lobby, paused reconnect
 // Fixes vs v12:
 //  - Explicit CORS middleware on Express level (Northflank/HTTP2 sometimes drops
 //    preflight headers, causing the client to see "xhr poll error" on connection)
@@ -27,13 +27,13 @@ app.use((req, res, next) => {
 });
 
 app.get("/", (_req, res) => {
-  res.send("Penalty Kings multiplayer server v14 stable ready-gated is running.");
+  res.send("Penalty Kings multiplayer server v15 no forced lobby / paused reconnect is running.");
 });
 
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
-    version: "v14",
+    version: "v15",
     rooms: rooms.size,
     waiting: !!waitingSocketId,
     uptime: process.uptime()
@@ -216,6 +216,40 @@ function clearAllRoomTimers(room) {
   }
 }
 
+function roomHasTwoConnectedPlayers(room) {
+  if (!room || !Array.isArray(room.players) || room.players.length < 2) return false;
+  return room.players.every((id) => {
+    const s = getSocket(id);
+    return !!(s && s.connected) && !(room.disconnected && room.disconnected[id]);
+  });
+}
+
+function emitRoomPaused(room, reason = "waiting-reconnect") {
+  if (!room) return;
+  for (const id of room.players) {
+    const s = getSocket(id);
+    if (s && s.connected) {
+      s.emit("matchPaused", {
+        roomId: room.id,
+        reason,
+        message: "Match paused while a player reconnects."
+      });
+    }
+  }
+}
+
+function resumeRoomIfReady(room) {
+  if (!room || !rooms.has(room.id)) return;
+  if (!room.gameStarted) return;
+  if (room.resolving) return;
+  const allReady = room.players.every((id) => room.ready[id]);
+  if (!allReady) return;
+  if (!roomHasTwoConnectedPlayers(room)) return;
+  emitMatchPayload(room, "matchReady");
+  startTurnTimeout(room);
+  console.log("Room resumed after reconnect:", room.id);
+}
+
 function deleteRoom(roomId, reason) {
   const room = rooms.get(roomId);
   if (!room) return;
@@ -274,6 +308,7 @@ function replaceSocketInRoom(room, oldId, newSocket) {
   newSocket.join(room.id);
   newSocket.data.roomId = room.id;
   touchRoom(room);
+  resumeRoomIfReady(room);
 }
 
 function scheduleDisconnect(socket, reason = "") {
@@ -286,6 +321,11 @@ function scheduleDisconnect(socket, reason = "") {
   // Do NOT immediately delete the room. Keep it alive and let the client recover.
   room.disconnected[socket.id] = { at: Date.now(), reason: String(reason || "") };
   touchRoom(room);
+  // v15: pause gameplay timers immediately. Do not auto-resolve turns while a
+  // browser/proxy connection is recovering, otherwise the match can finish while
+  // players are looking at a reconnect/lobby state.
+  clearTurnTimer(room);
+  emitRoomPaused(room, "socket-disconnect");
 
   for (const opponentId of room.players.filter((id) => id !== socket.id)) {
     const opp = getSocket(opponentId);
@@ -394,13 +434,28 @@ function maybeStopReliableStart(room) {
 function startTurnTimeout(room) {
   if (!room) return;
   clearTurnTimer(room);
+
+  // v15: do not run the countdown unless both current sockets are connected.
+  // This is the main fix for matches continuing server-side while clients are gone.
+  if (!roomHasTwoConnectedPlayers(room)) {
+    console.log("Turn timer paused waiting reconnect in room:", room.id);
+    emitRoomPaused(room, "waiting-reconnect");
+    return;
+  }
+
   room.turnTimer = setTimeout(() => {
     if (!rooms.has(room.id)) return;
-    // Auto-resolve missing choices with safe defaults so the match never freezes.
+    if (!roomHasTwoConnectedPlayers(room)) {
+      console.log("Turn auto-resolve skipped; player reconnecting in room:", room.id);
+      clearTurnTimer(room);
+      emitRoomPaused(room, "waiting-reconnect");
+      return;
+    }
+    // Auto-resolve missing choices with safe defaults so the match never freezes
+    // only when both players are actually connected.
     const shooterId = room.players[room.shooterIndex];
     const keeperId = room.players[1 - room.shooterIndex];
     if (!room.choices[shooterId]?.shot) {
-      // No shot: count as a soft miss
       room.choices[shooterId] = {
         ...room.choices[shooterId],
         shot: computeShotTarget(0, 0.10, 0.10)
@@ -637,6 +692,7 @@ io.on("connection", (socket) => {
       const oldId = recoverableRoom.players.find((id) => recoverableRoom.clientIds[id] === socket.data.clientId);
       replaceSocketInRoom(recoverableRoom, oldId, socket);
       socket.emit("recoveredRoom", payloadFor(recoverableRoom, socket.id));
+      resumeRoomIfReady(recoverableRoom);
       return;
     }
 
@@ -667,6 +723,7 @@ io.on("connection", (socket) => {
       if (room) {
         const oldId = room.players.find((id) => room.clientIds[id] === socket.data.clientId);
         replaceSocketInRoom(room, oldId, socket);
+        resumeRoomIfReady(room);
       }
     }
     if (!room || !room.players.includes(socket.id)) {
@@ -686,6 +743,7 @@ io.on("connection", (socket) => {
     const oldId = room.players.find((id) => room.clientIds[id] === socket.data.clientId);
     replaceSocketInRoom(room, oldId, socket);
     socket.emit("recoveredRoom", payloadFor(room, socket.id));
+    resumeRoomIfReady(room);
     for (const opponentId of room.players.filter((id) => id !== socket.id)) {
       const opp = getSocket(opponentId);
       if (opp) opp.emit("opponentReconnected", { roomId: room.id });
@@ -707,8 +765,15 @@ io.on("connection", (socket) => {
     if (allReady && !room.gameStarted) {
       room.gameStarted = true;
       emitMatchPayload(room, "matchReady");
-      startTurnTimeout(room);
-      console.log("Room ready, gameplay timer started:", room.id);
+      if (roomHasTwoConnectedPlayers(room)) {
+        startTurnTimeout(room);
+        console.log("Room ready, gameplay timer started:", room.id);
+      } else {
+        emitRoomPaused(room, "waiting-reconnect-before-start");
+        console.log("Room ready but timer paused until reconnect:", room.id);
+      }
+    } else if (allReady && room.gameStarted) {
+      resumeRoomIfReady(room);
     }
   });
 
@@ -795,5 +860,5 @@ io.on("connection", (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("Penalty Kings multiplayer server v14 stable ready-gated running on port", PORT);
+  console.log("Penalty Kings multiplayer server v15 no forced lobby paused reconnect running on port", PORT);
 });
