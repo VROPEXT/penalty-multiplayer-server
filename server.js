@@ -4,8 +4,8 @@ const { Server } = require("socket.io");
 const { randomUUID } = require("crypto");
 
 // =============================================================================
-// Penalty Kings multiplayer server v15 - no forced lobby, paused reconnect
-// Fixes vs v12:
+// Penalty Kings multiplayer server v16 - choice clientId identity fix
+// Fixes vs v15:
 //  - Explicit CORS middleware on Express level (Northflank/HTTP2 sometimes drops
 //    preflight headers, causing the client to see "xhr poll error" on connection)
 //  - Try/catch around the zombie sweep so a single bad room never crashes the server
@@ -27,13 +27,13 @@ app.use((req, res, next) => {
 });
 
 app.get("/", (_req, res) => {
-  res.send("Penalty Kings multiplayer server v15 no forced lobby / paused reconnect is running.");
+  res.send("Penalty Kings multiplayer server v16 choice clientId identity fix is running.");
 });
 
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
-    version: "v15",
+    version: "v16",
     rooms: rooms.size,
     waiting: !!waitingSocketId,
     uptime: process.uptime()
@@ -277,6 +277,43 @@ function findRoomByClientId(clientId) {
     }
   }
   return null;
+}
+
+function findPlayerIdByClientId(room, clientId) {
+  if (!room || !clientId || !room.clientIds) return null;
+  return room.players.find((id) => room.clientIds[id] === clientId) || null;
+}
+
+function attachSocketToRoomByClientId(room, socket, data = {}, preferredOldId = null) {
+  if (!room || !socket) return false;
+  updateSocketProfile(socket, data);
+  if (room.players.includes(socket.id)) return true;
+  const clientId = cleanClientId(data.clientId || socket.data.clientId);
+  let oldId = null;
+  if (preferredOldId && room.clientIds && room.clientIds[preferredOldId] === clientId) oldId = preferredOldId;
+  if (!oldId) oldId = findPlayerIdByClientId(room, clientId);
+  if (!oldId) return false;
+  replaceSocketInRoom(room, oldId, socket);
+  console.log("Recovered socket by clientId:", room.id, oldId, "->", socket.id);
+  return room.players.includes(socket.id);
+}
+
+function getRoomForSocketOrClient(data = {}, socket) {
+  updateSocketProfile(socket, data);
+  let room = data.roomId ? rooms.get(data.roomId) : null;
+  if (!room && socket.data.clientId) room = findRoomByClientId(socket.data.clientId);
+  if (room && !room.players.includes(socket.id)) {
+    attachSocketToRoomByClientId(room, socket, data);
+  }
+  return room;
+}
+
+function rejectChoice(socket, room, reason, extra = {}) {
+  socket.emit("choiceRejected", {
+    roomId: room ? room.id : (extra.roomId || null),
+    reason,
+    ...extra
+  });
 }
 
 function clearDisconnectTimer(room, socketId) {
@@ -751,7 +788,7 @@ io.on("connection", (socket) => {
   });
 
   socket.on("clientReady", (data = {}) => {
-    const room = rooms.get(data.roomId);
+    const room = getRoomForSocketOrClient(data, socket);
     if (!room || !room.players.includes(socket.id)) return;
     room.ready[socket.id] = true;
     touchRoom(room);
@@ -795,22 +832,41 @@ io.on("connection", (socket) => {
     removeWaiting(socket, true);
   });
 
-  socket.on("leaveMatch", () => {
+  socket.on("leaveMatch", (data = {}) => {
+    updateSocketProfile(socket, data);
+    const room = getRoomForSocketOrClient(data, socket);
+    if (room && !room.players.includes(socket.id)) {
+      attachSocketToRoomByClientId(room, socket, data);
+    }
     socket.data._manualLeave = true;
     leaveAllGameRooms(socket, true);
   });
 
   socket.on("shotChoice", (data = {}) => {
-    const room = rooms.get(data.roomId);
-    if (!room || room.resolving) return;
+    const room = getRoomForSocketOrClient(data, socket);
+    if (!room) return rejectChoice(socket, null, "room-not-found", { roomId: data.roomId || null });
+    if (room.resolving) return;
 
-    const shooterId = room.players[room.shooterIndex];
-    if (socket.id !== shooterId) return;
+    let shooterId = room.players[room.shooterIndex];
+    if (socket.id !== shooterId) {
+      attachSocketToRoomByClientId(room, socket, data, shooterId);
+      shooterId = room.players[room.shooterIndex];
+    }
+    if (socket.id !== shooterId) {
+      return rejectChoice(socket, room, "not-current-shooter", {
+        expectedRole: "shooter",
+        expectedPlayerId: shooterId,
+        yourSocketId: socket.id,
+        yourClientId: socket.data.clientId
+      });
+    }
 
     const aimNorm = clampNumber(data.aimNorm, -1, 1, NaN);
     const power = clampNumber(data.power, 0, 1, NaN);
     const precision = clampNumber(data.precision, 0, 1, NaN);
-    if (!Number.isFinite(aimNorm) || !Number.isFinite(power) || !Number.isFinite(precision)) return;
+    if (!Number.isFinite(aimNorm) || !Number.isFinite(power) || !Number.isFinite(precision)) {
+      return rejectChoice(socket, room, "bad-shot-payload", { expectedRole: "shooter" });
+    }
 
     room.choices[socket.id] = {
       ...room.choices[socket.id],
@@ -821,21 +877,37 @@ io.on("connection", (socket) => {
     io.to(room.id).emit("choiceLocked", {
       roomId: room.id,
       playerId: socket.id,
-      role: "shooter"
+      clientId: socket.data.clientId,
+      role: "shooter",
+      turn: room.turn
     });
 
     resolveTurn(room);
   });
 
   socket.on("diveChoice", (data = {}) => {
-    const room = rooms.get(data.roomId);
-    if (!room || room.resolving) return;
+    const room = getRoomForSocketOrClient(data, socket);
+    if (!room) return rejectChoice(socket, null, "room-not-found", { roomId: data.roomId || null });
+    if (room.resolving) return;
 
-    const keeperId = room.players[1 - room.shooterIndex];
-    if (socket.id !== keeperId) return;
+    let keeperId = room.players[1 - room.shooterIndex];
+    if (socket.id !== keeperId) {
+      attachSocketToRoomByClientId(room, socket, data, keeperId);
+      keeperId = room.players[1 - room.shooterIndex];
+    }
+    if (socket.id !== keeperId) {
+      return rejectChoice(socket, room, "not-current-keeper", {
+        expectedRole: "keeper",
+        expectedPlayerId: keeperId,
+        yourSocketId: socket.id,
+        yourClientId: socket.data.clientId
+      });
+    }
 
     const direction = Number(data.direction);
-    if (!VALID_DIRECTIONS.has(direction)) return;
+    if (!VALID_DIRECTIONS.has(direction)) {
+      return rejectChoice(socket, room, "bad-dive-payload", { expectedRole: "keeper" });
+    }
 
     room.choices[socket.id] = {
       ...room.choices[socket.id],
@@ -846,7 +918,9 @@ io.on("connection", (socket) => {
     io.to(room.id).emit("choiceLocked", {
       roomId: room.id,
       playerId: socket.id,
-      role: "keeper"
+      clientId: socket.data.clientId,
+      role: "keeper",
+      turn: room.turn
     });
 
     resolveTurn(room);
@@ -860,5 +934,5 @@ io.on("connection", (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("Penalty Kings multiplayer server v15 no forced lobby paused reconnect running on port", PORT);
+  console.log("Penalty Kings multiplayer server v16 choice identity fix running on port", PORT);
 });
