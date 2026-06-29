@@ -4,8 +4,8 @@ const { Server } = require("socket.io");
 const { randomUUID } = require("crypto");
 
 // =============================================================================
-// Penalty Kings multiplayer server v17 - stable clientId roles + refresh resume
-// Fixes vs v15:
+// Penalty Kings multiplayer server v18 - fast choices + stable quit
+// Fixes vs v17:
 //  - Explicit CORS middleware on Express level (Northflank/HTTP2 sometimes drops
 //    preflight headers, causing the client to see "xhr poll error" on connection)
 //  - Try/catch around the zombie sweep so a single bad room never crashes the server
@@ -27,13 +27,13 @@ app.use((req, res, next) => {
 });
 
 app.get("/", (_req, res) => {
-  res.send("Penalty Kings multiplayer server v17 stable clientId roles + refresh resume is running.");
+  res.send("Penalty Kings multiplayer server v18 fast choices + stable quit is running.");
 });
 
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
-    version: "v19",
+    version: "v18",
     rooms: rooms.size,
     waiting: !!waitingSocketId,
     uptime: process.uptime()
@@ -74,7 +74,7 @@ const MAX_REPLAY_X = POST_X + 1.15;
 
 // Tunable timing
 const RECONNECT_GRACE_MS = 120000;      // v14: keep rooms alive during proxy/browser reconnects
-const TURN_CHOICE_TIMEOUT_MS = 20000;   // v18: from 30s to 20s - still generous but less waiting
+const TURN_CHOICE_TIMEOUT_MS = 12000;   // v18: safety only; BOTH choices resolve immediately
 const ZOMBIE_ROOM_TIMEOUT_MS = 5 * 60 * 1000;  // 5 minutes
 const ZOMBIE_SWEEP_INTERVAL_MS = 60 * 1000;    // every minute
 const RELIABLE_START_RETRIES = 60;      // v14: keep resending start until both clients confirm
@@ -387,6 +387,12 @@ function replaceSocketInRoom(room, oldId, newSocket) {
   transfer(room.score, 0);
   transfer(room.ready, false);
   if (room.choices[oldId]) { room.choices[newSocket.id] = room.choices[oldId]; delete room.choices[oldId]; }
+  // v18: choices are also stored by stable clientId, so a socket swap cannot make the
+  // server wait until the timeout even though both browsers already locked.
+  const stableCid = room.clientIds[newSocket.id] || cleanClientId(newSocket.data.clientId);
+  if (stableCid && room.choicesByClient && room.choicesByClient[stableCid]) {
+    room.choices[newSocket.id] = { ...(room.choices[newSocket.id] || {}), ...(room.choicesByClient[stableCid] || {}) };
+  }
   clearDisconnectTimer(room, oldId);
   newSocket.join(room.id);
   newSocket.data.roomId = room.id;
@@ -546,17 +552,11 @@ function startTurnTimeout(room) {
     // only when both players are actually connected.
     const shooterId = room.players[room.shooterIndex];
     const keeperId = room.players[1 - room.shooterIndex];
-    if (!room.choices[shooterId]?.shot) {
-      room.choices[shooterId] = {
-        ...room.choices[shooterId],
-        shot: computeShotTarget(0, 0.10, 0.10)
-      };
+    if (!hasChoiceForPlayer(room, shooterId, 'shot')) {
+      setChoiceForPlayer(room, shooterId, 'shot', computeShotTarget(0, 0.10, 0.10));
     }
-    if (room.choices[keeperId]?.dive === undefined) {
-      room.choices[keeperId] = {
-        ...room.choices[keeperId],
-        dive: 0
-      };
+    if (!hasChoiceForPlayer(room, keeperId, 'dive')) {
+      setChoiceForPlayer(room, keeperId, 'dive', 0);
     }
     console.log("Turn auto-resolved due to timeout in room:", room.id);
     resolveTurn(room);
@@ -598,6 +598,8 @@ function makeRoom(playerA, playerB) {
     maxTurns: MAX_TURNS,
     shooterIndex: 0,
     choices: {},
+    choicesByClient: {},
+    choiceTurns: {},
     ready: {},
     gameStarted: false,
     resolving: false,
@@ -640,13 +642,64 @@ function makeRoom(playerA, playerB) {
   // v14: do NOT start turn timeout yet. Wait until both browsers send clientReady.
 }
 
+
+function choiceForPlayer(room, playerId, key) {
+  if (!room || !playerId) return undefined;
+  const direct = room.choices && room.choices[playerId] ? room.choices[playerId][key] : undefined;
+  if (direct !== undefined) return direct;
+  const cid = room.clientIds && room.clientIds[playerId];
+  const byCid = cid && room.choicesByClient && room.choicesByClient[cid] ? room.choicesByClient[cid][key] : undefined;
+  if (byCid !== undefined) return byCid;
+  return undefined;
+}
+
+function setChoiceForPlayer(room, playerId, key, value) {
+  if (!room || !playerId) return;
+  room.choices[playerId] = { ...(room.choices[playerId] || {}), [key]: value };
+  const cid = room.clientIds && room.clientIds[playerId];
+  if (cid) {
+    room.choicesByClient = room.choicesByClient || {};
+    room.choicesByClient[cid] = { ...(room.choicesByClient[cid] || {}), [key]: value, turn: room.turn };
+  }
+  room.choiceTurns = room.choiceTurns || {};
+  room.choiceTurns[playerId] = room.turn;
+}
+
+function hasChoiceForPlayer(room, playerId, key) {
+  return choiceForPlayer(room, playerId, key) !== undefined;
+}
+
+function emitChoiceLockedFast(room, playerId, role) {
+  if (!room || !rooms.has(room.id)) return;
+  const shooterId = room.players[room.shooterIndex];
+  const keeperId = room.players[1 - room.shooterIndex];
+  const bothLocked = !!choiceForPlayer(room, shooterId, 'shot') && choiceForPlayer(room, keeperId, 'dive') !== undefined;
+  io.to(room.id).emit("choiceLocked", {
+    roomId: room.id,
+    playerId,
+    clientId: room.clientIds[playerId] || null,
+    role,
+    turn: room.turn,
+    bothLocked,
+    shooterClientId: room.clientIds[shooterId] || null,
+    keeperClientId: room.clientIds[keeperId] || null
+  });
+  if (bothLocked) {
+    io.to(room.id).emit("bothChoicesLocked", {
+      roomId: room.id,
+      turn: room.turn,
+      message: "Both choices locked. Resolving now."
+    });
+  }
+}
+
 function resolveTurn(room) {
   if (!room || room.resolving) return;
 
   const shooterId = room.players[room.shooterIndex];
   const keeperId = room.players[1 - room.shooterIndex];
-  const shot = room.choices[shooterId]?.shot;
-  const dive = room.choices[keeperId]?.dive;
+  const shot = choiceForPlayer(room, shooterId, 'shot');
+  const dive = choiceForPlayer(room, keeperId, 'dive');
 
   if (!shot || dive === undefined) return;
 
@@ -694,14 +747,13 @@ function resolveTurn(room) {
   });
 
   setTimeout(() => {
-    // v18: between-turn delay reduced from 3000ms to 1200ms.
-    // The client already plays the ball animation in slow-mo and shows the
-    // result text. 3 seconds on top of that felt extremely slow.
-    // v12 SAFETY: if the room was deleted during the wait (quit, disconnect),
+    // v12 SAFETY: if the room was deleted during the 3s wait (quit, disconnect),
     // do NOT try to emit anything further. The room is gone.
     if (!rooms.has(room.id)) return;
 
     room.choices = {};
+    room.choicesByClient = {};
+    room.choiceTurns = {};
     room.turn++;
     room.resolving = false;
     touchRoom(room);
@@ -742,7 +794,7 @@ function resolveTurn(room) {
 
     // Start choice timeout for next turn
     startTurnTimeout(room);
-  }, 2500);
+  }, 3000);
 }
 
 // =============================================================================
@@ -935,20 +987,13 @@ io.on("connection", (socket) => {
       return rejectChoice(socket, room, "bad-shot-payload", { expectedRole: "shooter" });
     }
 
-    room.choices[shooterId] = {
-      ...room.choices[shooterId],
-      shot: computeShotTarget(aimNorm, power, precision)
-    };
+    setChoiceForPlayer(room, shooterId, "shot", computeShotTarget(aimNorm, power, precision));
     touchRoom(room);
 
-    io.to(room.id).emit("choiceLocked", {
-      roomId: room.id,
-      playerId: shooterId,
-      clientId: room.clientIds[shooterId] || socket.data.clientId,
-      role: "shooter",
-      turn: room.turn
-    });
+    emitChoiceLockedFast(room, shooterId, "shooter");
 
+    // v18: do not wait for the timeout/retry loop. As soon as both stable-clientId
+    // choices are present, resolve immediately on the same tick.
     resolveTurn(room);
   });
 
@@ -975,20 +1020,13 @@ io.on("connection", (socket) => {
       return rejectChoice(socket, room, "bad-dive-payload", { expectedRole: "keeper" });
     }
 
-    room.choices[keeperId] = {
-      ...room.choices[keeperId],
-      dive: direction
-    };
+    setChoiceForPlayer(room, keeperId, "dive", direction);
     touchRoom(room);
 
-    io.to(room.id).emit("choiceLocked", {
-      roomId: room.id,
-      playerId: keeperId,
-      clientId: room.clientIds[keeperId] || socket.data.clientId,
-      role: "keeper",
-      turn: room.turn
-    });
+    emitChoiceLockedFast(room, keeperId, "keeper");
 
+    // v18: do not wait for the timeout/retry loop. As soon as both stable-clientId
+    // choices are present, resolve immediately on the same tick.
     resolveTurn(room);
   });
 
@@ -1000,5 +1038,5 @@ io.on("connection", (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("Penalty Kings multiplayer server v19 desync fix running on port", PORT);
+  console.log("Penalty Kings multiplayer server v18 fast choices + stable quit running on port", PORT);
 });
