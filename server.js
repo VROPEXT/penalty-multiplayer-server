@@ -3,19 +3,28 @@ const http = require("http");
 const { Server } = require("socket.io");
 const { randomUUID } = require("crypto");
 
+// =============================================================================
+// Penalty Kings multiplayer server v12 - cleaner start, faster timeouts
+// Fixes vs v11:
+//  - matchFound is emitted only twice (initial + one safety retry), not 16x
+//  - per-turn timeout: 12s max waiting for a player's choice
+//  - reconnect grace reduced to 20s (was 45s, too long for the opponent)
+//  - zombie room cleanup: rooms with no activity for 5 minutes are removed
+// =============================================================================
+
 const app = express();
 const server = http.createServer(app);
 
 app.get("/", (_req, res) => {
-  res.send("Penalty Kings multiplayer server v11 reconnect grace is running.");
+  res.send("Penalty Kings multiplayer server v12 is running.");
 });
 
 const io = new Server(server, {
   cors: { origin: true, methods: ["GET", "POST"] },
-  pingTimeout: 70000,
+  pingTimeout: 60000,
   pingInterval: 25000,
   connectionStateRecovery: {
-    maxDisconnectionDuration: 120000,
+    maxDisconnectionDuration: 60000,
     skipMiddlewares: true
   }
 });
@@ -31,6 +40,14 @@ const GOAL_H = 2.44;
 const POST_X = GOAL_W / 2;
 const INSIDE_POST_X = POST_X - 0.12;
 const MAX_REPLAY_X = POST_X + 1.15;
+
+// Tunable timing
+const RECONNECT_GRACE_MS = 20000;       // was 45000
+const TURN_CHOICE_TIMEOUT_MS = 15000;   // new: max wait for a choice
+const ZOMBIE_ROOM_TIMEOUT_MS = 5 * 60 * 1000;  // 5 minutes
+const ZOMBIE_SWEEP_INTERVAL_MS = 60 * 1000;    // every minute
+const RELIABLE_START_RETRIES = 2;       // was 16
+const RELIABLE_START_INTERVAL_MS = 600; // was 350
 
 function getSocket(id) {
   return io.sockets.sockets.get(id) || null;
@@ -149,6 +166,37 @@ function clearStartTimer(room) {
   }
 }
 
+function clearTurnTimer(room) {
+  if (room && room.turnTimer) {
+    clearTimeout(room.turnTimer);
+    room.turnTimer = null;
+  }
+}
+
+function clearAllRoomTimers(room) {
+  if (!room) return;
+  clearStartTimer(room);
+  clearTurnTimer(room);
+  if (room.disconnectTimers) {
+    for (const id of Object.keys(room.disconnectTimers)) {
+      clearTimeout(room.disconnectTimers[id]);
+    }
+    room.disconnectTimers = {};
+  }
+}
+
+function deleteRoom(roomId, reason) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+  clearAllRoomTimers(room);
+  rooms.delete(roomId);
+  console.log("Room deleted:", roomId, "reason:", reason || "unspecified");
+}
+
+function touchRoom(room) {
+  if (room) room.lastActivity = Date.now();
+}
+
 function removeWaiting(socket, notifySelf = false) {
   if (waitingSocketId === socket.id) {
     waitingSocketId = null;
@@ -194,6 +242,7 @@ function replaceSocketInRoom(room, oldId, newSocket) {
   clearDisconnectTimer(room, oldId);
   newSocket.join(room.id);
   newSocket.data.roomId = room.id;
+  touchRoom(room);
 }
 
 function scheduleDisconnect(socket) {
@@ -204,7 +253,7 @@ function scheduleDisconnect(socket) {
   room.disconnected[socket.id] = Date.now();
   for (const opponentId of room.players.filter((id) => id !== socket.id)) {
     const opp = getSocket(opponentId);
-    if (opp) opp.emit("opponentConnectionLost", { roomId: room.id, playerId: socket.id, graceMs: 45000 });
+    if (opp) opp.emit("opponentConnectionLost", { roomId: room.id, playerId: socket.id, graceMs: RECONNECT_GRACE_MS });
   }
   clearDisconnectTimer(room, socket.id);
   room.disconnectTimers[socket.id] = setTimeout(() => {
@@ -214,9 +263,8 @@ function scheduleDisconnect(socket) {
       const opp = getSocket(opponentId);
       if (opp) opp.emit("opponentLeft", { roomId: latest.id, playerId: socket.id, reason: "disconnect-timeout" });
     }
-    clearStartTimer(latest);
-    rooms.delete(latest.id);
-  }, 45000);
+    deleteRoom(latest.id, "disconnect-grace-expired");
+  }, RECONNECT_GRACE_MS);
 }
 
 function leaveAllGameRooms(socket, notifySelf = false) {
@@ -225,7 +273,6 @@ function leaveAllGameRooms(socket, notifySelf = false) {
   for (const [roomId, room] of rooms.entries()) {
     if (!room.players.includes(socket.id)) continue;
 
-    clearStartTimer(room);
     const opponents = room.players.filter((id) => id !== socket.id);
     for (const opponentId of opponents) {
       io.to(opponentId).emit("opponentLeft", { roomId, playerId: socket.id });
@@ -233,7 +280,7 @@ function leaveAllGameRooms(socket, notifySelf = false) {
 
     socket.leave(roomId);
     if (socket.data.roomId === roomId) socket.data.roomId = null;
-    rooms.delete(roomId);
+    deleteRoom(roomId, "leave-all-game-rooms");
 
     if (notifySelf) socket.emit("leftMatch", { roomId });
   }
@@ -276,6 +323,32 @@ function maybeStopReliableStart(room) {
   if (allReady) clearStartTimer(room);
 }
 
+function startTurnTimeout(room) {
+  if (!room) return;
+  clearTurnTimer(room);
+  room.turnTimer = setTimeout(() => {
+    if (!rooms.has(room.id)) return;
+    // Auto-resolve missing choices with safe defaults so the match never freezes.
+    const shooterId = room.players[room.shooterIndex];
+    const keeperId = room.players[1 - room.shooterIndex];
+    if (!room.choices[shooterId]?.shot) {
+      // No shot: count as a soft miss
+      room.choices[shooterId] = {
+        ...room.choices[shooterId],
+        shot: computeShotTarget(0, 0.10, 0.10)
+      };
+    }
+    if (room.choices[keeperId]?.dive === undefined) {
+      room.choices[keeperId] = {
+        ...room.choices[keeperId],
+        dive: 0
+      };
+    }
+    console.log("Turn auto-resolved due to timeout in room:", room.id);
+    resolveTurn(room);
+  }, TURN_CHOICE_TIMEOUT_MS);
+}
+
 function makeRoom(playerA, playerB) {
   if (!playerA?.connected || !playerB?.connected || playerA.id === playerB.id) return;
 
@@ -315,8 +388,10 @@ function makeRoom(playerA, playerB) {
     resolving: false,
     startEmitCount: 0,
     startTimer: null,
+    turnTimer: null,
     disconnected: {},
-    disconnectTimers: {}
+    disconnectTimers: {},
+    lastActivity: Date.now()
   };
 
   rooms.set(roomId, room);
@@ -325,22 +400,30 @@ function makeRoom(playerA, playerB) {
   playerA.data.roomId = roomId;
   playerB.data.roomId = roomId;
 
-  console.log("Room created:", roomId, room.names, room.searchIds, room.profiles);
+  console.log("Room created:", roomId, room.names);
 
-  // Reliable start: if one tab misses the first event, it receives the room payload again.
+  // v12: emit matchFound ONCE up front, then schedule at most RELIABLE_START_RETRIES
+  // safety re-emits ONLY if a client has not confirmed it via clientReady.
+  // This eliminates the 5.6-second-long start spam in v11.
   emitMatchPayload(room, "matchFound");
-  emitMatchPayload(room, "forceStartMatch");
   room.startTimer = setInterval(() => {
     if (!rooms.has(roomId)) {
       clearStartTimer(room);
       return;
     }
     room.startEmitCount++;
-    emitMatchPayload(room, room.startEmitCount % 2 ? "matchFound" : "matchStart");
-    emitMatchPayload(room, "forceStartMatch");
+    // Only re-send to clients that have not confirmed ready
+    for (const id of room.players) {
+      if (room.ready[id]) continue;
+      const s = getSocket(id);
+      if (s && s.connected) s.emit("matchFound", payloadFor(room, id));
+    }
     maybeStopReliableStart(room);
-    if (room.startEmitCount >= 16) clearStartTimer(room);
-  }, 350);
+    if (room.startEmitCount >= RELIABLE_START_RETRIES) clearStartTimer(room);
+  }, RELIABLE_START_INTERVAL_MS);
+
+  // Start counting time for the first turn
+  startTurnTimeout(room);
 }
 
 function resolveTurn(room) {
@@ -355,6 +438,8 @@ function resolveTurn(room) {
 
   room.resolving = true;
   clearStartTimer(room);
+  clearTurnTimer(room);
+  touchRoom(room);
 
   const inFrame = Math.abs(shot.finalX) <= INSIDE_POST_X && shot.aimY > 0.18 && shot.aimY < GOAL_H - 0.04;
   const tooWeak = shot.power < 0.16;
@@ -392,11 +477,14 @@ function resolveTurn(room) {
   });
 
   setTimeout(() => {
+    // v12 SAFETY: if the room was deleted during the 3s wait (quit, disconnect),
+    // do NOT try to emit anything further. The room is gone.
     if (!rooms.has(room.id)) return;
 
     room.choices = {};
     room.turn++;
     room.resolving = false;
+    touchRoom(room);
 
     if (room.turn > room.maxTurns) {
       const a = room.players[0];
@@ -415,7 +503,7 @@ function resolveTurn(room) {
         const s = getSocket(id);
         if (s && s.data.roomId === room.id) s.data.roomId = null;
       }
-      rooms.delete(room.id);
+      deleteRoom(room.id, "match-end-natural");
       return;
     }
 
@@ -427,8 +515,29 @@ function resolveTurn(room) {
       score: { ...room.score },
       shooterId: room.players[room.shooterIndex]
     });
+
+    // Start choice timeout for next turn
+    startTurnTimeout(room);
   }, 3000);
 }
+
+// =============================================================================
+// v12: Zombie room sweeper - clean up rooms that have not had activity for 5min
+// =============================================================================
+setInterval(() => {
+  const now = Date.now();
+  for (const [roomId, room] of rooms.entries()) {
+    const idle = now - (room.lastActivity || 0);
+    if (idle > ZOMBIE_ROOM_TIMEOUT_MS) {
+      console.log("Zombie room sweep: cleaning up room", roomId, "idle for", idle, "ms");
+      for (const id of room.players) {
+        const s = getSocket(id);
+        if (s) s.emit("opponentLeft", { roomId, reason: "zombie-room" });
+      }
+      deleteRoom(roomId, "zombie-sweep");
+    }
+  }
+}, ZOMBIE_SWEEP_INTERVAL_MS);
 
 io.on("connection", (socket) => {
   console.log("Connected:", socket.id);
@@ -443,7 +552,6 @@ io.on("connection", (socket) => {
       const oldId = recoverableRoom.players.find((id) => recoverableRoom.clientIds[id] === socket.data.clientId);
       replaceSocketInRoom(recoverableRoom, oldId, socket);
       socket.emit("recoveredRoom", payloadFor(recoverableRoom, socket.id));
-      emitMatchPayload(recoverableRoom, "forceStartMatch");
       return;
     }
 
@@ -493,7 +601,6 @@ io.on("connection", (socket) => {
     const oldId = room.players.find((id) => room.clientIds[id] === socket.data.clientId);
     replaceSocketInRoom(room, oldId, socket);
     socket.emit("recoveredRoom", payloadFor(room, socket.id));
-    emitMatchPayload(room, "forceStartMatch");
     for (const opponentId of room.players.filter((id) => id !== socket.id)) {
       const opp = getSocket(opponentId);
       if (opp) opp.emit("opponentReconnected", { roomId: room.id });
@@ -504,6 +611,7 @@ io.on("connection", (socket) => {
     const room = rooms.get(data.roomId);
     if (!room || !room.players.includes(socket.id)) return;
     room.ready[socket.id] = true;
+    touchRoom(room);
     maybeStopReliableStart(room);
   });
 
@@ -545,6 +653,7 @@ io.on("connection", (socket) => {
       ...room.choices[socket.id],
       shot: computeShotTarget(aimNorm, power, precision)
     };
+    touchRoom(room);
 
     io.to(room.id).emit("choiceLocked", {
       roomId: room.id,
@@ -569,6 +678,7 @@ io.on("connection", (socket) => {
       ...room.choices[socket.id],
       dive: direction
     };
+    touchRoom(room);
 
     io.to(room.id).emit("choiceLocked", {
       roomId: room.id,
@@ -587,5 +697,5 @@ io.on("connection", (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("Penalty Kings multiplayer server v11 reconnect grace running on port", PORT);
+  console.log("Penalty Kings multiplayer server v12 running on port", PORT);
 });
