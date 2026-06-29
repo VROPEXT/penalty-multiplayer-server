@@ -33,7 +33,7 @@ app.get("/", (_req, res) => {
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
-    version: "v18",
+    version: "v19",
     rooms: rooms.size,
     waiting: !!waitingSocketId,
     uptime: process.uptime()
@@ -742,7 +742,7 @@ function resolveTurn(room) {
 
     // Start choice timeout for next turn
     startTurnTimeout(room);
-  }, 1200);
+  }, 2500);
 }
 
 // =============================================================================
@@ -1000,5 +1000,5 @@ io.on("connection", (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("Penalty Kings multiplayer server v18 speed boost running on port", PORT);
+  console.log("Penalty Kings multiplayer server v19 desync fix running on port", PORT);
 });
